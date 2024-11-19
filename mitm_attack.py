@@ -2,7 +2,7 @@ import os
 import socket
 import struct
 import threading
-from time import sleep, strftime
+from time import sleep, time
 from datetime import datetime
 
 
@@ -35,20 +35,25 @@ def log_to_history(file_path, ip):
         print(f"[+] Registrado no histórico: {ip}")
 
 
-def discover_first_host(local_ip, history_file):
-    """Procura o primeiro IP ativo na sub-rede do IP local."""
+def discover_hosts(local_ip, history_file, duration=60):
+    """Procura IPs ativos na sub-rede do IP local dentro de um período de tempo."""
     subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
     print(f"[*] Varredura na sub-rede: {subnet}.0/24")
+    active_hosts = []
+    start_time = time()
+
     for i in range(1, 255):  # Varre todos os IPs da sub-rede
         target_ip = f"{subnet}.{i}"
+        if time() - start_time > duration:
+            break  # Interrompe após a duração especificada
         if target_ip == local_ip:
             continue  # Ignora o IP local
         if is_host_alive(target_ip):
             log_to_history(history_file, target_ip)  # Atualiza o histórico
-            print(f"[+] Primeiro host ativo encontrado: {target_ip}")
-            return target_ip
-    print("[!] Nenhum host ativo encontrado.")
-    return None
+            active_hosts.append(target_ip)
+
+    print("[*] Varredura concluída.")
+    return active_hosts
 
 
 def is_host_alive(ip):
@@ -116,10 +121,23 @@ def main():
     print(f"[+] IP local detectado: {local_ip}")
     print(f"[+] MAC local detectado: {local_mac}")
 
-    # Varredura para encontrar o primeiro host ativo
-    target_ip = discover_first_host(local_ip, history_file)
-    if not target_ip:
+    # Varredura para encontrar hosts ativos
+    active_hosts = discover_hosts(local_ip, history_file, duration=30)
+
+    if not active_hosts:
         print("[!] Nenhum host ativo encontrado para atacar.")
+        return
+
+    # Exibe os hosts ativos e permite escolher um
+    print("\nHosts ativos encontrados:")
+    for idx, ip in enumerate(active_hosts):
+        print(f"{idx + 1}. {ip}")
+
+    try:
+        choice = int(input("\nEscolha o número do IP a ser atacado: ")) - 1
+        target_ip = active_hosts[choice]
+    except (ValueError, IndexError):
+        print("[!] Escolha inválida.")
         return
 
     # Determina o IP do gateway (assumindo o .1 da sub-rede como gateway)
