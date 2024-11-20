@@ -49,7 +49,7 @@ def is_host_alive(ip):
 def discover_hosts(local_ip, active_hosts, history_file, thread_count=50):
     """Realiza a varredura de IPs ativos na sub-rede."""
     subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
-    print(f"[*] Iniciando varredura na sub-rede: {subnet}.0/24")
+    print(f"[*] Iniciando varredura na sub-rede: {subnet}.0/25")
 
     ip_queue = Queue()
     for i in range(1, 255):
