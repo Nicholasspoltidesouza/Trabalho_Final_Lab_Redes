@@ -309,36 +309,30 @@ def set_promiscuous_mode(interface, enable=True):
 
     sock.close()
 
-# Dicionário global para rastrear o último acesso por domínio
-last_accessed = {}
-
-def should_log_entry(domain, threshold=60):
-    """
-    Verifica se um domínio deve ser registrado com base no tempo decorrido desde o último acesso.
-
-    Args:
-        domain (str): O domínio a ser verificado.
-        threshold (int): Intervalo de tempo mínimo, em segundos, para considerar um novo registro.
-
-    Returns:
-        bool: True se o domínio deve ser registrado, False caso contrário.
-    """
-    current_time = time.time()
-    if domain in last_accessed:
-        # Verifica o intervalo desde o último registro
-        if current_time - last_accessed[domain] < threshold:
-            return False  # Ignorar se está dentro do intervalo
-    # Atualiza o timestamp do último acesso e permite o registro
-    last_accessed[domain] = current_time
-    return True
-
 def capture_traffic(interface, output_file, valid_macs):
     """
-    Captura pacotes DNS, HTTP e HTTPS, registrando as consultas no formato de URL clicável.
+    Captura apenas pacotes DNS de dispositivos na rede, excluindo o IP local,
+    e registra os domínios como URLs clicáveis.
     """
-    # Obter o IP da máquina local para ignorar durante a captura
+    # Cache para evitar duplicação de registros
+    dns_cache = set()
+
+    # Determinar o IP local (ignorar este IP na captura)
     local_ip = get_network_info()[1]
 
+    # Atualizar a tabela ARP periodicamente para capturar novos dispositivos
+    def update_arp_cache():
+        while True:
+            new_macs = get_active_macs(interface)
+            valid_macs.update(new_macs)
+            print(f"[INFO] Tabela ARP atualizada: {new_macs}")
+            time.sleep(30)  # Atualiza a cada 30 segundos
+
+    # Iniciar thread para atualizar a tabela ARP
+    arp_update_thread = threading.Thread(target=update_arp_cache, daemon=True)
+    arp_update_thread.start()
+
+    # Configurar socket para captura de pacotes
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
     sock.bind((interface, 0))  # Vincula o socket à interface fornecida
 
@@ -361,118 +355,54 @@ def capture_traffic(interface, output_file, valid_macs):
                 ip_proto = struct.unpack("!B", ip_header[9:10])[0]
                 src_ip = socket.inet_ntoa(ip_header[12:16])
 
-                # Ignorar pacotes que vêm do IP local
+                # Ignorar o tráfego da máquina local
                 if src_ip == local_ip:
                     continue
 
-                # Processar tráfego HTTP
-                if ip_proto == 6:  # TCP
-                    tcp_header = packet[34:54]
-                    src_port, dest_port = struct.unpack("!HH", tcp_header[:4])
-                    payload_offset = 14 + 20 + ((tcp_header[12] >> 4) * 4)  # Ethernet + IP + TCP
-                    payload = packet[payload_offset:]
-
-                    # HTTP
-                    if dest_port == 80:  # Porta HTTP
-                        try:
-                            http_data = payload.decode(errors="ignore")
-                            if "Host:" in http_data:
-                                host_line = [line for line in http_data.split("\r\n") if line.startswith("Host:")][0]
-                                host = host_line.split(": ")[1]
-                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                                url = f"http://{host}"
-                                f.write(f"<li>{timestamp} - {src_ip} -> HTTP URL: <a href=\"{url}\">{url}</a></li>\n")
-                                print(f"[+] HTTP: {url}")
-                                f.flush()
-                        except Exception as e:
-                            print(f"[Erro] Não foi possível processar HTTP: {e}")
-
-                    # HTTPS
-                    elif dest_port == 443:  # Porta HTTPS
-                        try:
-                            tls_data = payload
-                            sni = extract_sni(tls_data)
-                            if sni:
-                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                                url = f"https://{sni}"
-                                f.write(f"<li>{timestamp} - {src_ip} -> HTTPS SNI: <a href=\"{url}\">{sni}</a></li>\n")
-                                print(f"[+] HTTPS: {url}")
-                                f.flush()
-                        except Exception as e:
-                            print(f"[Erro] Não foi possível processar HTTPS: {e}")
-
                 # Captura de pacotes DNS
-                elif ip_proto == 17:  # UDP
+                if ip_proto == 17:  # UDP
                     udp_header = packet[34:42]
                     src_port, dest_port = struct.unpack("!HH", udp_header[:4])
                     if dest_port == 53:  # DNS
                         dns_data = packet[42:]
                         domain = extract_dns_query(dns_data)
-                        if domain and should_log_entry(domain):  # Aplica o filtro de tempo
+                        if domain and domain not in dns_cache:
+                            dns_cache.add(domain)
                             timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                            url = f"http://{domain}"
+
+                            # Formatar o domínio como URL
+                            if domain.startswith("www."):
+                                url = f"http://{domain}"
+                            else:
+                                url = f"http://{domain}"
+
+                            # Registrar no arquivo HTML
                             f.write(f"<li>{timestamp} - {src_ip} -> DNS Query: <a href=\"{url}\">{domain}</a></li>\n")
-                            print(f"[+] DNS: {domain}")
+                            print(f"[+] {timestamp} - {src_ip} -> DNS Query: {domain}")
                             f.flush()
         except KeyboardInterrupt:
             print("\n[INFO] Captura interrompida pelo usuário.")
         f.write("</ul></body></html>\n")
 
-
-def extract_sni(tls_data):
-    """
-    Extrai o Server Name Indication (SNI) de um pacote TLS Client Hello.
-    """
-    try:
-        # Verifica se o pacote é um Handshake TLS e contém um Client Hello
-        if tls_data[0] == 0x16 and tls_data[5] == 0x01:  # Registro TLS + Client Hello
-            session_id_length = tls_data[43]
-            cipher_suites_length = struct.unpack("!H", tls_data[44 + session_id_length:46 + session_id_length])[0]
-            extensions_length_start = 46 + session_id_length + cipher_suites_length + 2
-            extensions_length = struct.unpack("!H", tls_data[extensions_length_start:extensions_length_start + 2])[0]
-            extensions_start = extensions_length_start + 2
-            extensions_end = extensions_start + extensions_length
-
-            # Itera sobre as extensões para encontrar o SNI
-            i = extensions_start
-            while i < extensions_end:
-                extension_type = struct.unpack("!H", tls_data[i:i + 2])[0]
-                extension_length = struct.unpack("!H", tls_data[i + 2:i + 4])[0]
-                if extension_type == 0x00:  # Tipo de extensão SNI
-                    server_name_length = struct.unpack("!H", tls_data[i + 9:i + 11])[0]
-                    server_name_bytes = tls_data[i + 11:i + 11 + server_name_length]
-                    try:
-                        # Tenta decodificar o nome do servidor como UTF-8
-                        return server_name_bytes.decode("utf-8")
-                    except UnicodeDecodeError:
-                        return None
-                i += 4 + extension_length
-    except Exception as e:
-        print(f"[Erro] Falha ao processar SNI: {e}")
-    return None
-
-
-
-
 def extract_dns_query(dns_data):
     """
-    Extrai o nome do domínio de uma consulta DNS.
+    Extrai o domínio de uma consulta DNS, lidando com bytes inválidos.
     """
     try:
-        transaction_id, flags, qd_count = struct.unpack("!HHH", dns_data[:6])
-        if qd_count > 0:
-            index = 12
-            domain_parts = []
-            while True:
-                length = dns_data[index]
-                if length == 0:
-                    break
-                domain_parts.append(dns_data[index + 1:index + 1 + length].decode("utf-8"))
-                index += length + 1
-            return ".".join(domain_parts)
+        domain_parts = []
+        i = 12  # DNS payload começa após o cabeçalho de 12 bytes
+        while True:
+            length = dns_data[i]
+            if length == 0:  # Final do nome
+                break
+            domain_parts.append(dns_data[i + 1:i + 1 + length].decode('latin-1'))  # 'latin-1' para lidar com bytes inválidos
+            i += length + 1
+        return '.'.join(domain_parts)
     except Exception as e:
-        print(f"[Erro] Falha ao extrair DNS Query: {e}")
-    return None
+        print(f"[Erro] Não foi possível extrair a consulta DNS: {e}")
+        return None
+
+
 
 # Função para obter o MAC do atacante
 def get_attacker_mac(interface):
