@@ -288,22 +288,6 @@ def capture_traffic(interface, output_file):
                                 f.flush()
                             except Exception as e:
                                 print(f"[Erro] Não foi possível processar o pacote HTTP: {e}")
-
-                        elif dest_port == 443:  # HTTPS
-                            # Extraindo SNI do handshake TLS (se disponível)
-                            try:
-                                if payload[0] == 0x16:  # Registro TLS
-                                    server_name = extract_sni(payload)
-                                    timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-                                    if server_name:
-                                        url = f"https://{server_name}/"
-                                        f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - <a href=\"{url}\">{url}</a></li>\n")
-                                        print(f"[+] HTTPS URL Capturada (SNI): {url}")
-                                    else:
-                                        f.write(f"<li>{timestamp} - {src_ip} -> {dest_ip}:{dest_port} - URL não identificada (HTTPS)</li>\n")
-                                    f.flush()
-                            except Exception as e:
-                                print(f"[Erro] Não foi possível processar o pacote HTTPS: {e}")
         except KeyboardInterrupt:
             print("\n[INFO] Captura interrompida pelo usuário.")
         f.write("</ul></body></html>\n")
