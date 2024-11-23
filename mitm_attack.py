@@ -18,7 +18,7 @@ def enable_ip_forwarding():
     """
     subprocess.run(["sysctl", "-w", "net.ipv4.ip_forward=1"], check=True)
 
-
+# Função para pegar informações da rede
 def get_network_info():
     """
     Detecta a interface de rede ativa, IP e máscara de sub-rede.
@@ -55,7 +55,8 @@ def get_network_info():
         return interface_name, ip_address, netmask
     else:
         raise Exception("Não foi possível encontrar uma interface de rede válida.")
-    
+
+# Função para descobrir hosts ativos na rede    
 def discover_hosts(local_ip, active_hosts, history_file, thread_count=50):
     """Realiza a varredura de IPs ativos na sub-rede."""
     subnet = ".".join(local_ip.split(".")[:3])  # Determina a sub-rede (ex.: 192.168.1)
@@ -199,6 +200,7 @@ def log_to_history(file_path, ip):
         history_file.write(f"{timestamp} - IP encontrado: {ip}\n")
         print(f"[+] Registrado no histórico: {ip}")
 
+# Função para obter o MAC do atacante
 def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     """
     Cria um pacote ARP para spoofing.
@@ -224,6 +226,7 @@ def create_arp_packet(target_ip, target_mac, sender_ip, sender_mac):
     )
     return ether_header + arp_header
 
+# Função para obter o MAC de um IP
 def get_mac(ip, interface):
     """
     Obtém o MAC address associado a um IP usando a tabela ARP do sistema.
@@ -240,6 +243,7 @@ def get_mac(ip, interface):
         print(f"Erro ao obter o MAC do IP {ip}: {e}")
     raise Exception(f"MAC não encontrado para o IP {ip}")
 
+# Função para obter IPs e MACs ativos
 def get_active_macs(interface):
     """
     Obtém uma lista de IPs e MACs ativos na rede usando a tabela ARP.
@@ -278,6 +282,7 @@ def arp_spoof(target_ip, gateway_ip, interface):
         sock.send(gateway_packet)
         time.sleep(2)
 
+# Função para ativar o modo promíscuo
 def set_promiscuous_mode(interface, enable=True):
     """
     Ativa ou desativa o modo promíscuo na interface de rede de forma segura.
@@ -309,6 +314,7 @@ def set_promiscuous_mode(interface, enable=True):
 
     sock.close()
 
+# Função para capturar tráfego de rede
 def capture_traffic(interface, output_file, valid_macs):
     """
     Captura apenas pacotes DNS de dispositivos na rede, excluindo o IP local,
@@ -384,6 +390,7 @@ def capture_traffic(interface, output_file, valid_macs):
             print("\n[INFO] Captura interrompida pelo usuário.")
         f.write("</ul></body></html>\n")
 
+# Função para extrair a consulta DNS
 def extract_dns_query(dns_data):
     """
     Extrai o domínio de uma consulta DNS, lidando com bytes inválidos.
@@ -413,12 +420,13 @@ def get_attacker_mac(interface):
     sock.bind((interface, 0))
     return sock.getsockname()[4]
 
+# Função para atualizar a tabela ARP
 def update_valid_macs(interface, valid_macs):
     new_macs = get_active_macs(interface)
     valid_macs.update(new_macs)
     print(f"[INFO] Tabela ARP atualizada. Novos dispositivos: {new_macs}")
 
-
+# Função principal
 def main():
     try:
         print("[*] Iniciando a aplicação...")
